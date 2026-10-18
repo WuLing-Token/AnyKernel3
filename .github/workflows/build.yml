@@ -1300,9 +1300,8 @@ jobs:
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          # 彻底去掉版本尾部的品牌后缀（如 @LingLuo / @Yu1ct），避免内核完整版本被污染。
           if [ "${{ inputs.ksu_variant }}" == "BakaSU" ]; then
-            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%"' >> "$DEFCONFIG"
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@%REPO_NAME%"' >> "$DEFCONFIG"
           fi
 
           if [ "${{ inputs.ksu_variant }}" == "SukiSU" ] || [ "${{ inputs.ksu_variant }}" == "BakaSU" ]; then

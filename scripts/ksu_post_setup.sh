@@ -18,7 +18,7 @@ apply_bakasu() {
   local kbuild="$KSU_DIR/kernel/Kbuild"
   if [ -f "$kbuild" ]; then
     local pat=$(echo "${PATTERNS[bakasu]}" | base64 -d)
-    sed -i "s/^${pat}\$/REPO_NAME :=/" "$kbuild"
+    sed -i "s/^${pat}\$/REPO_NAME := ${BRAND}/" "$kbuild"
     git -C "$KSU_DIR" update-index --skip-worktree kernel/Kbuild
   fi
 }
@@ -30,7 +30,7 @@ apply_sukisu() {
   done
   if [ -n "$kbuild" ]; then
     local pat=$(echo "${PATTERNS[sukisu_branch]}" | base64 -d)
-    sed -i "s/${pat}//" "$kbuild"
+    sed -i "s/${pat}/@${BRAND}/" "$kbuild"
     local rel="${kbuild#${KSU_DIR}/}"
     git -C "$KSU_DIR" update-index --skip-worktree "$rel"
   fi
