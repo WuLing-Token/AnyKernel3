@@ -9,6 +9,22 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# 列出当前目录下不属于上游的 .rej（相对路径，已排序）。
+# 上游分支可能自带已提交的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej，
+# 是上游解决合并冲突时的残留），那不是本补丁的冲突；但 patch 失败时会覆盖同名文件，
+# 所以只有「被 git 跟踪且未改动」的才视为上游自带。
+# 不在 git 仓库里（本地验证）时 git 命令为空，退回全部 .rej
+list_upstream_rej() {
+  git ls-files -- '*.rej' 2>/dev/null | while IFS= read -r f; do
+    git diff --quiet -- "$f" 2>/dev/null && echo "$f"
+  done
+}
+list_untracked_rej() {
+  comm -23 \
+    <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
+    <(list_upstream_rej | sort)
+}
+
 echo "应用 SUSFS 补丁..."
 
 SUSFS_PATCH="50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch"
@@ -91,6 +107,34 @@ CURRENT_SUB="$SUB_LEVEL"
 if [[ ! "$CURRENT_SUB" =~ ^[0-9]+$ ]]; then
   CURRENT_SUB=99999
 fi
+
+# ---- susfs4ksu R28 getpriority/priority uid filter 开关归一化 ----
+# 该特性整套代码（含 susfs_switch_to_ksu_domain / susfs_restore_creds 两个辅助
+# 函数）以 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 为开关，但 SukiSU(builtin)、
+# BakaSU、FinaSU 的原生驱动 Kconfig 均未定义该选项，同时 SukiSU 驱动的
+# supercall 分发（CMD_SUSFS_SET_PRIORITY_UID_FILTER）与 pkg_observer 无条件调用
+# susfs_set_priority_uid_filter / susfs_parse_priority_app_strings，于是：
+#   - susfs.c 的两个辅助函数失去唯一调用方，clang -Werror,-Wunused-function
+#     直接中断编译（FinaSU/BakaSU/SukiSU 三个变体均复现）；
+#   - susfs.h 中的声明被裁掉，SukiSU 驱动侧报 -Wimplicit-function-declaration。
+# 把开关上提到 CONFIG_KSU_SUSFS（启用 SUSFS 时恒为 y）使特性完整可用。
+# 仅改写预处理指令行：susfs.c 里 copy_config_to_buf() 的
+# "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n" 字符串字面量保持原样，管理器
+# 仍能按原名识别该特性。
+normalize_priority_uid_filter_guard() {
+  local f
+  # 主补丁中的 +#ifdef/+#endif 行（不触碰上下文行，hunk 行数不变，可正常应用）
+  [[ -f "$SUSFS_PATCH" ]] \
+    && sed -i -E '/^[+ ]*#[[:space:]]*(ifdef|ifndef|endif).*CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/ s/CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/CONFIG_KSU_SUSFS/' "$SUSFS_PATCH"
+  # 已拷贝进内核树的源码与头文件
+  for f in fs/susfs.c include/linux/susfs.h; do
+    [[ -f "$f" ]] || continue
+    sed -i -E '/^#[[:space:]]*(ifdef|ifndef|endif).*CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/ s/CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER/CONFIG_KSU_SUSFS/' "$f"
+  done
+}
+
+normalize_priority_uid_filter_guard
+echo "已把 PRIORITY_UID_FILTER 开关归一化为 CONFIG_KSU_SUSFS"
 
 # 兼容缺少 VMA padding 接口的 5.10.66～209、5.15.74～144 和 6.1.25～68
 if grep -qF 'VMA_PAD_START(vma)' "$SUSFS_PATCH" \
@@ -622,11 +666,12 @@ if [[ -f fs/susfs.c ]] && grep -qF 'security_sb_statfs(' fs/susfs.c \
   sed -i '0,/^#include <linux\/fs.h>$/s//#include <linux\/fs.h>\n#include <linux\/security.h>/' fs/susfs.c
 fi
 
-# 在编译前报告 SUSFS 主补丁产生的冲突文件
-SUSFS_REJ_COUNT=$(find . -name '*.rej' | wc -l)
+# 在编译前报告 SUSFS 主补丁产生的冲突文件，上游自带的已提交 .rej 不计入
+mapfile -t SUSFS_REJ_FILES < <(list_untracked_rej)
+SUSFS_REJ_COUNT=${#SUSFS_REJ_FILES[@]}
 if [ "$SUSFS_REJ_COUNT" -gt 0 ]; then
   echo "::warning title=SUSFS 补丁冲突::SUSFS 主补丁产生了 ${SUSFS_REJ_COUNT} 个 .rej 冲突文件，可能导致后续编译失败（详见 Rejects 产物）"
-  find . -name '*.rej' -print
+  printf '%s\n' "${SUSFS_REJ_FILES[@]}"
 fi
 
 # 还原仅用于补丁匹配的临时源码调整
@@ -693,8 +738,16 @@ if [[ -n "$SUPER_FS_H_REMOVED" ]] \
 fi
 
 fix_missing_vm_flags_clear() {
-  if [[ "$OS_PATCH_LEVEL" == "2024-11" ]] && grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c; then
+  # Google 2024-11 及更新的 deprecated 分支带入了 16KB 页迁移的 VMA padding：
+  # mm/mmap.c 的 copy_vma() 调用 vm_flags_clear()，但同分支 include/linux 未
+  # 提供该（6.3+ 才引入的）helper，clang -Werror 报隐式声明中断编译。
+  # 按源码内容检测：helper 齐备（6.6+ 原生）或无调用时自动跳过，
+  # 不再按 OS_PATCH_LEVEL 猜测命中范围（android13-5.10 / android14-5.15 的
+  # 2024-11 分支与 android12-5.10 / android13-5.15 同样命中）。
+  if grep -qF 'vm_flags_clear(new_vma, VM_PAD_MASK);' ./mm/mmap.c \
+    && ! grep -Rqs 'vm_flags_clear' ./include/linux; then
     sed -i 's/vm_flags_clear(new_vma, VM_PAD_MASK);/new_vma->vm_flags \&= ~VM_PAD_MASK;/' ./mm/mmap.c
+    echo "已替换 mm/mmap.c 缺失 helper 的 vm_flags_clear 调用（VMA padding 半回移兼容）"
   fi
 }
 
@@ -709,17 +762,18 @@ fix_task_mmu_show_pad() {
   fi
 }
 
+# mmap.c 的 vm_flags_clear 半回移修复对所有内核统一按内容检测（函数内部自带
+# 守卫，helper 齐备或无调用时为空操作），覆盖各 android 版本 2024-11 起
+# 持续更新的 deprecated 分支
+fix_missing_vm_flags_clear
+
 # Android 12 - 5.10 修复
 if [[ "$ANDROID_VERSION" == "android12" && "$KERNEL_VERSION" == "5.10" ]]; then
-  # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-  fix_missing_vm_flags_clear
   fix_task_mmu_show_pad 209
 fi
 
 # Android 13 - 5.15 修复
-  if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
-  # 修复 2024-11 分支: mmap.c 调用了 vm_flags_clear()，但同分支 mm.h 未提供 helper
-  fix_missing_vm_flags_clear
+if [[ "$ANDROID_VERSION" == "android13" && "$KERNEL_VERSION" == "5.15" ]]; then
   fix_task_mmu_show_pad 148 "2024-05"
 fi
 
